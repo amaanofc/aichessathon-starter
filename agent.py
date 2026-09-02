@@ -4,9 +4,23 @@ import random
 import time
 
 import chess
+from chess.polyglot import zobrist_hash
 
 # Import time runs once per game, inside a 60 second budget, before your clock starts.
 # Load weights and build tables out here, not inside get_move.
+
+# --- Game-memory state (persists across calls within one game, per contract) ---
+# A shadow board tracking the real game as played, kept in sync every call by
+# inferring the opponent's move from the FEN we're handed. This gives us
+# correct, native repetition detection (board.is_repetition) instead of
+# hand-rolled position hashing, and it doubles as new-game detection: if we
+# can't find a legal continuation that reproduces the incoming FEN, we treat
+# it as a fresh game and reset everything.
+_game_board: "chess.Board | None" = None
+_last_choice_at: dict[int, str] = {}
+
+CONTEMPT_THRESHOLD = 150   # centipawns; only dodge a repeat when clearly ahead
+NEAR_TIE_MARGIN = 40       # centipawns; max we'll give up to avoid repeating
 
 PIECE_VALUES = {
     chess.PAWN: 100,
@@ -42,8 +56,56 @@ class SearchTimeout(Exception):
     pass
 
 
+def _sync_game_board(fen: str) -> chess.Board:
+    """Update the persistent shadow board with whatever the opponent just
+    played, inferred from the FEN we've been handed. Falls back to treating
+    this as a new game if nothing matches (including the very first call)."""
+    global _game_board, _last_choice_at
+    incoming = chess.Board(fen)
+
+    if _game_board is not None:
+        target = incoming.epd()  # position only: no move counters
+        for opp_move in _game_board.legal_moves:
+            probe = _game_board.copy(stack=False)
+            probe.push(opp_move)
+            if probe.epd() == target:
+                _game_board.push(opp_move)
+                return incoming
+        # No legal continuation reproduces this position: new game.
+
+    _game_board = incoming.copy(stack=True)
+    _last_choice_at = {}
+    return incoming
+
+
+def _pick_final_move(candidates, best_move, best_score):
+    """Among moves within NEAR_TIE_MARGIN of the best score, avoid replaying
+    the move we made last time we were in this exact position, but only if
+    we're clearly ahead and the position has already repeated once."""
+    if best_score < CONTEMPT_THRESHOLD or not _game_board.is_repetition(2):
+        return best_move
+
+    key = zobrist_hash(_game_board)
+    avoid = _last_choice_at.get(key)
+    alternatives = [
+        (m, s) for m, s in candidates
+        if m.uci() != avoid and best_score - s <= NEAR_TIE_MARGIN
+    ]
+    return max(alternatives, key=lambda ms: ms[1])[0] if alternatives else best_move
+
+
+def _finalize(board, chosen: "chess.Move") -> str:
+    """Every return path funnels through here so the shadow board and the
+    per-position move memory stay in sync regardless of which branch (panic,
+    single-move, timeout, or full search) produced the chosen move."""
+    key = zobrist_hash(board)
+    _last_choice_at[key] = chosen.uci()
+    _game_board.push(chosen)
+    return chosen.uci()
+
+
 def get_move(fen: str, time_left_ms: int) -> str:
-    board = chess.Board(fen)
+    board = _sync_game_board(fen)
     legal_move_list = list(board.legal_moves)
 
     if not legal_move_list:
@@ -54,14 +116,14 @@ def get_move(fen: str, time_left_ms: int) -> str:
 
     if len(legal_move_list) == 1:
         # No decision to make. Don't spend any clock or CPU searching it.
-        return legal_move_list[0].uci()
+        return _finalize(board, legal_move_list[0])
 
     panic_best = random.choice(legal_move_list)
 
     if time_left_ms <= CRITICAL_MS:
         # Too little time left to safely run even one checked iteration.
         # Move immediately rather than risk any overshoot at all.
-        return panic_best.uci()
+        return _finalize(board, panic_best)
 
     # Budget is the minimum of three independent caps, so none of them can
     # individually push us past the real clock:
@@ -80,6 +142,8 @@ def get_move(fen: str, time_left_ms: int) -> str:
     search_state = {"nodes": 0, "deadline": deadline}
 
     best_move = None
+    best_score = -float("inf")
+    last_depth_candidates: list[tuple[chess.Move, float]] = []
 
     for depth in range(1, MAX_DEPTH):
         alpha = -float("inf")
@@ -87,6 +151,7 @@ def get_move(fen: str, time_left_ms: int) -> str:
 
         depth_best_move = None
         depth_best_score = -float("inf")
+        depth_candidates: list[tuple[chess.Move, float]] = []
 
         try:
             for move in order_moves(board, best_move):
@@ -99,22 +164,29 @@ def get_move(fen: str, time_left_ms: int) -> str:
                 finally:
                     board.pop()
 
+                depth_candidates.append((move, score))
                 if score > depth_best_score:
                     depth_best_score = score
                     depth_best_move = move
                     alpha = max(alpha, depth_best_score)
 
         except SearchTimeout:
-            return best_move.uci() if best_move else panic_best.uci()
+            chosen = best_move if best_move else panic_best
+            chosen = _pick_final_move(last_depth_candidates, chosen, best_score)
+            return _finalize(board, chosen)
 
         if depth_best_move is not None:
             best_move = depth_best_move
+            best_score = depth_best_score
+            last_depth_candidates = depth_candidates
 
         # Found a forced mate; no point searching deeper.
         if depth_best_score >= MATE_SCORE - MAX_DEPTH:
             break
 
-    return best_move.uci() if best_move else panic_best.uci()
+    chosen = best_move if best_move else panic_best
+    chosen = _pick_final_move(last_depth_candidates, chosen, best_score)
+    return _finalize(board, chosen)
 
 
 def negmax(board, depth, state, alpha, beta):
